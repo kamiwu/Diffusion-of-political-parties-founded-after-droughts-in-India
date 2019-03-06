@@ -1,0 +1,256 @@
+---
+title: "Social Network Analytics Homework 3"
+output: html_notebook
+---
+
+Load libraries and data sets. Do some basic data cleaning.
+```{r}
+library(igraph)
+library(dplyr)
+library(ggplot2)
+library(plm)
+library(pglm)
+
+district <- read.csv("C:/MSBA/MSBA Files/socialnetwork/homework/hw3/district_information.csv")
+rain <- read.csv("C:/MSBA/MSBA Files/socialnetwork/homework/hw3/rain_information.csv")
+border <- read.csv("C:/MSBA/MSBA Files/socialnetwork/homework/hw3/border_information.csv")
+new_party <- read.csv("C:/MSBA/MSBA Files/socialnetwork/homework/hw3/new_parties_in_each_district_by_candidate.csv")
+
+# only select observations before 2000, drop NA values
+rain <- rain %>% filter(year < 2000)
+rain$rain[rain$rain == 0] <- NA
+rain <- na.omit(rain)
+
+# elections in 1985 are outliers so I deleted them 
+district <- district %>% filter(year != 1985)
+
+# the border table is directed, to make it easy for following analysis, I reverse the sequence of district column and focal_district column so we can have information of both sides
+reverse <- cbind.data.frame(focal_district = border$district, district = border$focal_district) 
+border <- rbind.data.frame(border, reverse)
+border <- unique(border)
+
+# drop null values in new_party table
+new_party <- new_party %>% filter(party_name != "")
+```
+
+## Question 1 -- A
+Manipulate rain data to make the year period consistent to that of district data. Since we don't know which year is the election year before 1951, I just use 1946 as the beginning year for calculating the interval:
+```{r}
+adjrain <- data.frame()
+election_year <- district$year[1:13]
+
+for (i in unique(rain$district)) {
+  dis <- rain %>% filter(district == i) 
+  x <- 1
+  for (j in election_year) {
+    agent <- adjrain
+    adjrain <- cbind.data.frame(district = i, year = j, dis[x:(which(dis$year == j)),] %>% summarise(aveSPI = mean(spi), sumRAIN = sum(rain)))
+    adjrain <- rbind.data.frame(agent, adjrain)
+    x <- 1+which(dis$year == j)
+  }
+}
+```
+
+Join rain data and district data:
+```{r results='hide'}
+join_data <- inner_join(district,adjrain,by=c("district","year"))
+```
+Plot the sum of the raw rainfall against the number of political parties:
+```{r}
+ggplot(join_data, aes(y = new_parties, x = sumRAIN)) + geom_point() + labs(title ="Relationship Between the Level of Rainfall and the Number of New Parties", x = "Sum of Rainfall", y = "Number of New Parties") + theme_minimal()
+```
+Plot the yearly average of the SPI against the number of political parties:
+```{r}
+ggplot(join_data, aes(y = new_parties, x = aveSPI)) + geom_point() + labs(title ="Relationship Between the Level of Rainfall and the Number of New Parties", x = "Yearly Average of SPI", y = "Number of New Parties") + theme_minimal()
+```
+
+## Question 1 -- B
+Create a table, and 2 new columns of the lagged value of rainfull and SPI:
+```{r}
+regressiondata <- adjrain
+regressiondata$lagSPI <- append(0,regressiondata$aveSPI[-length(regressiondata$district)])
+regressiondata$lagRAIN <- append(0,regressiondata$sumRAIN[-length(regressiondata$district)])
+```
+Compute the lagged value of neighbors' rainfall variable:
+```{r}
+neighborlag <- data.frame()
+
+for (i in unique(regressiondata$district)) {
+  neighbor <- as.vector(border[which(border$focal_district == i),2])
+  
+  newneighborlag <- regressiondata %>% filter(district %in% neighbor) %>% group_by(year) %>% summarise(neighborlagSPI = mean(lagSPI), neighborlagRAIN = mean(lagRAIN), district = i)
+  neighborlag <- rbind.data.frame(neighborlag,newneighborlag)
+}
+```
+Combine 2 tables together and delete the first election year of every district due to the lag:
+```{r results='hide'}
+regressiondata <- inner_join(regressiondata,neighborlag,by = c("district","year"))
+
+index <- c()
+for (i in unique(regressiondata$district)) {
+  ind <- first(which(regressiondata$district == i))
+  index <- append(index,ind)
+}
+regressiondata <- regressiondata[-index,]
+```
+Create a new column of the number of years within every election period, it worth mentioning that **since 1951 is the first year of the election, I set the interval year of 1951 as 0**:
+```{r}
+regressiondata$interval <- 0
+regressiondata[regressiondata$year == 1957,][,'interval'] <- 6
+regressiondata[regressiondata$year == 1962,][,'interval'] <- 5
+regressiondata[regressiondata$year == 1967,][,'interval'] <- 5
+regressiondata[regressiondata$year == 1971,][,'interval'] <- 4
+regressiondata[regressiondata$year == 1977,][,'interval'] <- 6
+regressiondata[regressiondata$year == 1980,][,'interval'] <- 3
+regressiondata[regressiondata$year == 1984,][,'interval'] <- 4
+regressiondata[regressiondata$year == 1989,][,'interval'] <- 5
+regressiondata[regressiondata$year == 1991,][,'interval'] <- 2
+regressiondata[regressiondata$year == 1996,][,'interval'] <- 5
+regressiondata[regressiondata$year == 1998,][,'interval'] <- 2
+regressiondata[regressiondata$year == 1999,][,'interval'] <- 1
+```
+
+Regress SPI on its lagged value and the lagged value of its neighbors' SPI, set inerval year as a control:
+```{r}
+SPIvalue <- plm(aveSPI ~ lagSPI + neighborlagSPI + factor(interval), regressiondata, effect = "twoways", model = "within", index = "district")
+summary(SPIvalue)
+```
+Regress raw rainfall on its lagged value and the lagged value of neighbors' raw rainfall:
+```{r}
+RAINvalue <- plm(sumRAIN ~ lagRAIN + neighborlagRAIN + factor(interval), regressiondata, effect = "twoways", model = "within", index = "district")
+summary(RAINvalue)
+```
+**From the outcome, we can see that both the raw rainfall and the SPI are positively correlated with its lagged value, but negatively correlated with the lagged value of its neighbors' rainfall variable.**
+
+## Question 1 -- C
+Calculate extreme weather occurred within each interval:
+```{r}
+rextrain <- data.frame()
+index <- c()
+
+for (i in unique(rain$district)) {
+  dis <- rain %>% filter(district == i) 
+  x <- 1
+  for (j in election_year) {
+    agent <- rextrain
+    rextrain <- cbind.data.frame(district = i, year = j, dis[x:(which(dis$year == j)),] %>% summarise(extremeweather = sum(spi< -1 | spi > 1)))
+    rextrain <- rbind.data.frame(agent, rextrain)
+    x <- 1+which(dis$year == j)
+  }
+}
+```
+Create a new column of the lagged value of the measure:
+```{r results='hide'}
+extrain <- rextrain
+extrain$lagEXT <- append(0, extrain$extremeweather[-length(extrain$extremeweather)])
+extrain <- extrain %>% filter(year != 1951)
+```
+Compute the lagged value of neighbors' measure:
+```{r}
+neighborlagEXT <- data.frame()
+for (i in unique(extrain$district)) {
+  neighbor <- as.vector(border[which(border$focal_district == i),2])
+
+  newneighborlagEXT <- extrain %>% filter(district %in% neighbor) %>% group_by(year) %>% summarise(neighborlagEXT = mean(lagEXT), district = i)
+  neighborlagEXT <- rbind.data.frame(neighborlagEXT,newneighborlagEXT)
+}
+```
+Combine 2 tables together and delete the first election year of every district:
+```{r results='hide'}
+extrain <- inner_join(extrain,neighborlagEXT,by = c("district","year")) 
+```
+Create a new column of the number of years within every election period, it worth mentioning that **since 1951 is the first year of the election, I set the interval year of 1951 as 0**:
+```{r}
+extrain$interval <- 0
+extrain[extrain$year == 1957,][,'interval'] <- 6
+extrain[extrain$year == 1962,][,'interval'] <- 5
+extrain[extrain$year == 1967,][,'interval'] <- 5
+extrain[extrain$year == 1971,][,'interval'] <- 4
+extrain[extrain$year == 1977,][,'interval'] <- 6
+extrain[extrain$year == 1980,][,'interval'] <- 3
+extrain[extrain$year == 1984,][,'interval'] <- 4
+extrain[extrain$year == 1989,][,'interval'] <- 5
+extrain[extrain$year == 1991,][,'interval'] <- 2
+extrain[extrain$year == 1996,][,'interval'] <- 5
+extrain[extrain$year == 1998,][,'interval'] <- 2
+extrain[extrain$year == 1999,][,'interval'] <- 1
+```
+
+Regress the measure on its lagged value and the lagged value of neighbors':
+```{r}
+EXTvalue <- pglm(extremeweather ~ lagEXT + neighborlagEXT + interval, extrain, effect = "twoways", model = "within", index = "district", family = "poisson")
+summary(EXTvalue)
+```
+From the outcome, for this measure, the lagged value of itself and the lagged value of neighbors' doesn't show high correlation with the measure, which means droughts and floods occuring in one district is not associated with previous value, and is also not associated with it's neighbors' previous value. **Thus droughts and floods are random. While for the raw level of rainfall and the SPI, the correlation with the lagged value of neighbors' is pretty high. So the measure of extreme weather events can be a better variable for us to model the diffusion of political activity. As in the following questions we do use this measure and the value of neighbors' lagged measure to see the diffusion effect.**
+
+## Question 2
+Combine 2 tables, select the columns we need, create interval column:
+```{r results='hide'}
+newparty <- inner_join(extrain, district, by = c("district","year")) %>% select(district, year, new_parties, extremeweather, interval)
+newparty <- na.omit(newparty)
+```
+Regress the number of new parties on the number of years with extreme weather:
+```{r}
+EXTparty <- pglm(new_parties ~ extremeweather + interval, newparty, effect = "twoways", model = "within", index = "district", family = "poisson")
+summary(EXTparty)
+```
+**From the outcome, it shows that the relationship between the number of new parties and the droughts and floods is significant and the coefficient between them is positive, which indicates that when a district experiences extreme weather or economic disruption (the measure is a proxy for economic disruption as mentioned in the exercise), political parties are more likely to be formed.**
+
+## Question 3
+Combine 2 tables and select the columns we want:
+```{r results='hide'}
+neinewparty <- inner_join(district, extrain, by = c("district","year")) 
+
+neinewparty <- neinewparty %>% select(district,year,new_parties,extremeweather, neighborlagEXT, interval)
+```
+Regress the number of new parties on the number of years with extreme weather and neighbors' previous measure:
+```{r}
+neiEXTparty <- pglm(new_parties ~ extremeweather + neighborlagEXT + interval, neinewparty, effect = "twoways", model = "within", index = "district", family = "poisson")
+summary(neiEXTparty)
+```
+From the outcome, it shows that the number of new parties has strong and positive correlation with the number of extreme weather events and neighbors' extreme weather events in previous election period. **Which means that more droughts and floods occured in current election period of certain district and more droughts and floods occured in previous election period of neighbor districts will drive more parties to contest in current election. Thus economic disruption will lead more new parties to be found in current election, and neighbors' economic disruption also have an influence on the founding of new parties, but since it's a diffusion process so it takes time and it will affect the next election of the certain district.**
+
+## Question 4
+Combine 2 tables and select the columns we need:
+```{r results='hide'}
+HIregress <- inner_join(extrain, district, by = c("district", "year")) %>% select(district, year, extremeweather, interval, neighborlagEXT, political_concentration)
+```
+Regress the Herfindahl Index on the number of years with extreme weather and neighbors' previous measure:
+```{r}
+HIregression <- plm(political_concentration ~ extremeweather + neighborlagEXT + interval, HIregress, effect = "twoways", model = "within", index = "district")
+summary(HIregression)
+```
+From the outcome, it shows that the Herfindahl Index has a negative relationship with the number of years with extreme weather and neighbors' previous measure, though the relationship is not significant. **Which indicates that if there're more extreme weather events or economic disruption in a certain district, the concentration of political power will be lessened, and there's also a diffusion of this kind of effect from neighor districts. Extreme weather events can erode the stability of political systems.**
+
+## Question 5
+Calculate the 2 likelihoods:
+```{r}
+contestlikelihood <- data.frame()
+for (i in unique(neinewparty$district)) {
+  neighbor <- as.vector(border[which(border$focal_district == i),2])
+  for (j in election_year[-1]) {
+    districtparty <- as.vector(new_party[new_party$district == i & new_party$year == j,]$party_name)
+    neighparty <- as.vector(unique(new_party %>% filter(district %in% neighbor & year < j) %>% select(party_name))$party_name)
+    contest <- sum(districtparty %in% neighparty) / length(districtparty %in% neighparty)
+    nocontest <- (length(districtparty %in% neighparty) - sum(districtparty %in% neighparty)) / length(districtparty %in% neighparty)
+    agent <- cbind.data.frame(district = i,year = j,contest,nocontest)
+    contestlikelihood <- rbind(contestlikelihood, agent)
+  }
+}
+```
+Combine tables:
+```{r results='hide'}
+likeregress <- inner_join(contestlikelihood,extrain, by = c("district", "year"))
+likeregress <- na.omit(likeregress)
+```
+Regress the likelihood of contested parties with extreme weather events and neighbors' previous measure:
+```{r}
+likeregression <- plm(contest ~ extremeweather + neighborlagEXT + interval, likeregress, effect = "twoways", model = "within", index = "district")
+summary(likeregression)
+```
+Regress the likelihood of noncontested parties with extreme weather and neighbors' previous measure:
+```{r}
+nolikeregression <- plm(nocontest ~ extremeweather + neighborlagEXT + interval, likeregress, effect = "twoways", model = "within", index = "district")
+summary(nolikeregression)
+```
+From the outcome, though the correlations are not very significant, the correlation between contested parties and extreme weather events' measures is negative, and the correlation between noncontested parties and extreme weather events' measures is positive. **Thus we can say, with more extreme weathers, the new parties that appear in a district tend to not be the same parties that have appeared in neighboring districts in the past. This suggests that more extreme weather events or economic disruption will drive more new parties to contest, and the diffusion is the process of political organization rather than the content of a specific political party.**
